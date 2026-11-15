@@ -119,7 +119,7 @@ def main() -> int:
             print(problem)
     if found:
         print(
-            "Fix documentation links or prose wrapping; tables, fenced code, "
+            "Fix documentation links or prose wrapping, tables, fenced code, "
             "raw URLs, link definitions, and the top-level README are wrap-exempt."
         )
         return 1

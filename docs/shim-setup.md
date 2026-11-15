@@ -208,9 +208,9 @@ Other supported layouts require an explicit configuration change:
 
 | Daemon layout                          | Typical socket path                         | Guidance                                                       |
 | -------------------------------------- | ------------------------------------------- | -------------------------------------------------------------- |
-| `/opt/socket_vmnet` LaunchDaemon       | `/var/run/socket_vmnet`                     | Recommended; matches defaults                                  |
+| `/opt/socket_vmnet` LaunchDaemon       | `/var/run/socket_vmnet`                     | Recommended, matches defaults                                  |
 | Root Homebrew service on Apple Silicon | `/opt/homebrew/var/run/socket_vmnet`        | Set `network.socket_path` to this absolute path                |
-| Lima shared network                    | `/private/var/run/lima/socket_vmnet.shared` | Lima must keep the daemon running; set the exact observed path |
+| Lima shared network                    | `/private/var/run/lima/socket_vmnet.shared` | Lima must keep the daemon running, set the exact observed path |
 
 Do not choose a socket merely because it exists. Confirm which daemon owns it
 with `sudo launchctl print`, `pgrep -fl socket_vmnet`, and its plist or process
@@ -277,11 +277,11 @@ layer-by-layer diagnosis.
 | Output                                        | Cause                                                        | Correction                                                                         |
 | --------------------------------------------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
 | `Existing shim binary missing/not executable` | `softnet_bin` is wrong or installation was not completed     | Verify the source and rerun the guarded shim install, or correct the absolute path |
-| `PATH chooses a different softnet executable` | Another `softnet` shadows the configured binary              | Correct `softnet_bin`; `k8sctl` prepends its parent directory automatically        |
+| `PATH chooses a different softnet executable` | Another `softnet` shadows the configured binary              | Correct `softnet_bin`, `k8sctl` prepends its parent directory automatically        |
 | `shim is not root-owned SUID`                 | Ownership/mode does not meet Tart's expectation              | Re-audit the source, then reinstall with the guarded helper                        |
-| `socket_vmnet socket missing/not a socket`    | Daemon stopped or `socket_path` describes a different layout | Inspect LaunchDaemon state and process arguments; use the exact live socket        |
+| `socket_vmnet socket missing/not a socket`    | Daemon stopped or `socket_path` describes a different layout | Inspect LaunchDaemon state and process arguments, use the exact live socket        |
 | `Cannot connect to socket_vmnet socket`       | Socket permissions or daemon health problem                  | Check `ls -l`, group membership, daemon logs, and service state                    |
-| Preflight passes but VM has no IP             | Daemon/DHCP/gateway mismatch or guest-agent issue            | Inspect daemon logs and `logs/<vm>.log`; compare the plist with `cluster.toml`     |
+| Preflight passes but VM has no IP             | Daemon/DHCP/gateway mismatch or guest-agent issue            | Inspect daemon logs and `logs/<vm>.log`, compare the plist with `cluster.toml`     |
 | VMs get IPs but cannot reach each other       | Wrong helper selected or daemon/shim compatibility problem   | Recheck the selected shim and run the layer checks in `networking.md`              |
 
 ## Existing installations and recovery

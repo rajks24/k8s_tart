@@ -92,13 +92,13 @@ If you are starting from scratch, complete the [Softnet shim and socket_vmnet se
 
 ## Host prerequisites
 
-- Apple Silicon Mac with Tart installed; all VMs Ubuntu ARM64.
+- Apple Silicon Mac with Tart installed, all VMs Ubuntu ARM64.
 - Python **3.11+** (`python3 --version`, or `brew install python`). No PyPI packages.
 - `kubectl` on the Mac (`brew install kubectl`) for API management and smoke tests.
-- Functional `socket_vmnet` daemon and compatible `softnet` shim; follow the [from-scratch setup](docs/shim-setup.md) when they are not already installed.
+- Functional `socket_vmnet` daemon and compatible `softnet` shim, follow the [from-scratch setup](docs/shim-setup.md) when they are not already installed.
 - OpenSSH client and SSH keys for the Ubuntu `admin` account.
 - For fully unattended guest provisioning, `admin` must have passwordless sudo **on lab VMs only**. The interactive `access` helper can set this up.
-- VM networking reachable at `192.168.105.0/24` by default; edit config if not.
+- VM networking reachable at `192.168.105.0/24` by default, edit config if not.
 - Sufficient memory/storage: 2 vCPU/6 GiB CP, 2 vCPU/4 GiB per worker.
 
 Remote inputs are immutable by default: the Ubuntu OCI image is pinned by digest, and both the Flannel manifest and Kubernetes repository key are verified against SHA-256 values in `config/cluster.toml`. Treat changes to these values as supply-chain updates requiring review and a fresh disposable cluster test.
@@ -163,7 +163,7 @@ k8sctl preflight
 k8sctl status
 
 # If SSH public keys or passwordless sudo are not configured on the VMs:
-k8sctl access  # INTERACTIVE; changes guest authorized_keys + sudoers
+k8sctl access  # INTERACTIVE, changes guest authorized_keys + sudoers
 
 # Read-only Kubernetes adoption (downloads existing admin.conf, saves IP state):
 k8sctl adopt
@@ -215,7 +215,7 @@ vi config/cluster.toml
 cp config/cluster.toml config/cluster.local.toml
 k8sctl --config config/cluster.local.toml preflight
 
-# Required for stock images; skip only when SSH key + passwordless sudo are preconfigured
+# Required for stock images, skip only when SSH key + passwordless sudo are preconfigured
 k8sctl create
 k8sctl start
 k8sctl access
@@ -226,7 +226,7 @@ k8sctl context use
 k8sctl test
 ```
 
-After `start`, the CLI probes every VM and explicitly reports whether interactive `access` is required. `up` is designed to be re-runnable and checks for existing kubeadm files; it never forces a control-plane reinit. For **completely hands-off provisioning from scratch**, preconfigure SSH key access and passwordless sudo in a reusable Ubuntu base image, or run the `access` command once after creating new VMs. Standard upstream Ubuntu images require a first-login bootstrap.
+After `start`, the CLI probes every VM and explicitly reports whether interactive `access` is required. `up` is designed to be re-runnable and checks for existing kubeadm files and it never forces a control-plane reinit. For **completely hands-off provisioning from scratch**, preconfigure SSH key access and passwordless sudo in a reusable Ubuntu base image, or run the `access` command once after creating new VMs. Standard upstream Ubuntu images require a first-login bootstrap.
 
 Provision steps: `preflight -> clone missing VMs -> tart run --net-softnet -> agent IP + drift guard -> SSH/guest TCP checks -> Linux/containerd/K8s prep -> kubeadm init if missing -> Flannel if missing -> worker joins if missing -> wait for node Ready -> context use -> smoke test`.
 

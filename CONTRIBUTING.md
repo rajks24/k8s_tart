@@ -8,7 +8,7 @@ operations.
 ## Development setup
 
 Python 3.11 or newer is required. Runtime code uses only the standard library.
-Install Ruff for development using the version pinned in the CI workflow.
+Install the development linter with `python3 -m pip install ruff==0.13.2`.
 
 Run the local validation suite before opening a pull request:
 
@@ -39,7 +39,7 @@ targets and heading anchors.
 2. Add regression tests for behavior and safety checks.
 3. Never commit `.state`, kubeconfigs, keys, logs, reports, real MAC addresses,
    DHCP reservations, bootstrap tokens, or unreviewed diagnostic output.
-4. Pin new downloads and GitHub Actions by immutable digest or full commit SHA.
+4. Pin new remote downloads by immutable digest or full commit SHA.
 5. Explain destructive, privilege, networking, or compatibility implications.
 
 By submitting a contribution, you agree that it is licensed under Apache-2.0.

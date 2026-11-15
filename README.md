@@ -76,7 +76,7 @@ k8s_tart/
 │   ├── shim-setup.md               # From-scratch socket_vmnet and shim setup
 │   └── project-plan.md             # Work backlog and acceptance criteria
 ├── tests/test_lab.py               # Offline safety/config unit tests
-├── .github/workflows/             # Static validation and CodeQL CI
+├── .github/                       # Issue and pull-request templates
 ├── SECURITY.md                     # Private vulnerability reporting and boundaries
 ├── CONTRIBUTING.md                 # Contributor workflow and safety requirements
 ├── LICENSE                         # Apache License 2.0
@@ -254,6 +254,10 @@ Provision steps: `preflight -> clone missing VMs -> tart run --net-softnet -> ag
 
 Convenience: `make status`, `make doctor`, `make up`, `make monitor`, and `make test`. Destructive Make targets still require explicit flags, so prefer the direct CLI.
 
+## Softnet shim installation and recovery
+
+The [shim setup guide](docs/shim-setup.md) covers new installation, daemon configuration, preflight interpretation, and recovery. The project includes `scripts/host/network-inventory.sh` to capture the current state and a **manual-only**, guarded `scripts/host/restore-softnet-shim.sh` build/install helper. Neither is invoked by `up` or `start`.
+
 ## Day-2 lifecycle
 
 ```bash
@@ -310,7 +314,7 @@ The local unit tests do not need an Apple Mac or a running Kubernetes cluster. T
 - The shim does not enforce normal Softnet allow/block packet filtering. Treat these VMs as being on a shared L2 network and don't expose sensitive services.
 - `SOCKET_VMNET_PATH` is passed only to Tart child processes, not changed globally in your login shell.
 - The first machine-image provisioning needs network access for Ubuntu APT, Kubernetes packages, container images and the pinned Flannel manifest.
-- GitHub-hosted CI cannot run Tart/Virtualization.framework integration tests. Maintainers must validate provisioning, smoke tests, restart, and teardown on a disposable Apple Silicon lab before releasing.
+- Maintainers must validate provisioning, smoke tests, restart, and teardown on a disposable Apple Silicon lab before releasing.
 
 See [runbook](docs/runbook.md), [networking](docs/networking.md), and [project roadmap](docs/project-plan.md). Maintainers should also follow the [release checklist](docs/releasing.md) and apply the recommended [GitHub repository settings](docs/github-settings.md).
 
@@ -321,7 +325,3 @@ Read [SECURITY.md](SECURITY.md) before reporting vulnerabilities or sharing diag
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).
-
-## Softnet shim installation and recovery
-
-The [shim setup guide](docs/shim-setup.md) covers new installation, daemon configuration, preflight interpretation, and recovery. The project includes `scripts/host/network-inventory.sh` to capture the current state and a **manual-only**, guarded `scripts/host/restore-softnet-shim.sh` build/install helper. Neither is invoked by `up` or `start`.

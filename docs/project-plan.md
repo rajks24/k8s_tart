@@ -43,13 +43,12 @@ Acceptance: fresh lab reaches 3 Ready nodes, smoke tests pass and teardown safe.
 - [ ] Dedicated least-privilege SSH/sudo bootstrap image, replacing lab-wide
       NOPASSWD.
 - [ ] Automated launchd lifecycle if Mac sleep/reboot behaviour is acceptable.
-- [ ] CI/Ansible alternative when scaling beyond three guests.
+- [ ] Ansible alternative when scaling beyond three guests.
 - [ ] Cilium networking option (separate cluster), baseline policy testing.
 - [ ] Local metrics-server + optional Prometheus/Grafana + resource alerts.
 - [ ] Persistent volume POC, PodDisruptionBudget, rolling workloads, and etcd
       snapshots.
-- [ ] CI integration tests on a disposable Mac runner (current CI runs offline
-      checks).
+- [ ] Document a repeatable integration-test procedure for a disposable Mac.
 - [ ] Archive the existing shim source Git commit, binary SHA-256, and daemon
       service configuration (see `docs/shim-setup.md`).
 

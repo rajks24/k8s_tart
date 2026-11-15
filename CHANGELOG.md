@@ -7,8 +7,9 @@ Versioning and the structure of Keep a Changelog.
 
 ### Added
 
-- Public repository security, contribution, CI, and dependency-management files.
-- Consistent 80-column Markdown prose style with an offline CI check.
+- Public repository security and contribution files.
+- Consistent 80-column Markdown prose style with an offline documentation
+  check.
 - README lifecycle diagram and task-oriented documentation index with validated
   cross-document links.
 - Integrity verification for downloaded Flannel manifests.

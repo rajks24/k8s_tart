@@ -43,7 +43,7 @@ The top-level README remains the authoritative command overview.
 - [Release checklist](releasing.md) covers versioning, integrity review,
   disposable-lab testing, validation, tags, and release notes.
 - [Recommended GitHub settings](github-settings.md) covers repository security,
-  Actions policy, branch rules, and release protections.
+  branch rules, and release protections.
 - [Contributing](../CONTRIBUTING.md) defines development validation and safety
   expectations.
 - [Security policy](../SECURITY.md) defines private vulnerability reporting and

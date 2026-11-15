@@ -93,7 +93,7 @@ k8sctl status
 ```
 
 Follow each command's final `NEXT:`/`THEN:` output. In particular, do not run
-`up` after `start` reports missing SSH-key login or passwordless sudo and complete
+`up` after `start` reports missing SSH-key login or passwordless sudo. Complete
 interactive `access` first. `up` is safe to retry after a transient package or
 network failure and skips initialized/joined Kubernetes state.
 

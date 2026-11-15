@@ -1,0 +1,42 @@
+# Edit before first NEW installation. For your running cluster, use `adopt` first.
+[cluster]
+name = "tart-kubeadm-lab"
+ssh_user = "admin"
+ssh_private_key = "~/.ssh/id_ed25519"
+ubuntu_image = "ghcr.io/cirruslabs/ubuntu:24.04"
+kubernetes_minor = "v1.37"           # Kubernetes APT repository per minor release
+pod_cidr = "10.244.0.0/16"
+service_cidr = "10.96.0.0/12"
+flannel_version = "v0.28.10"          # Pinned release manifest
+ip_wait_seconds = 180
+ssh_wait_seconds = 120
+
+[network]
+mode = "softnet"
+# Existing shim; NOT installed or modified by this project.
+softnet_bin = "/opt/tart-vmnet-shim/bin/softnet"
+# Override this if your existing socket_vmnet daemon uses another socket.
+socket_path = "/private/var/run/lima/socket_vmnet.shared"
+subnet = "192.168.105.0/24"
+gateway = "192.168.105.1"
+
+[vm."k8s-cp"]
+role = "control-plane"
+cpu = 2
+memory_mib = 6144
+disk_gib = 40
+reserved_ip = ""  # Fill after creating a MAC-based DHCP reservation if desired.
+
+[vm."k8s-w1"]
+role = "worker"
+cpu = 2
+memory_mib = 4096
+disk_gib = 35
+reserved_ip = ""
+
+[vm."k8s-w2"]
+role = "worker"
+cpu = 2
+memory_mib = 4096
+disk_gib = 35
+reserved_ip = ""

@@ -1,0 +1,11 @@
+# Runtime data, logs, credentials, credentials-bearing diagnostics
+.state/
+logs/
+reports/
+__pycache__/
+*.py[cod]
+.DS_Store
+# downloaded third-party manifest cached by the tool
+vendor/kube-flannel-*.yml
+# existing separately managed shim source checkout; don't accidentally embed a nested Git repository
+socket-vmnet-shim/

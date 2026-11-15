@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import ipaddress
 import json
 import os
-from pathlib import Path
 import re
 import shlex
 import shutil
@@ -19,9 +19,11 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import urllib.request
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = ROOT / "config" / "cluster.toml"
@@ -30,7 +32,9 @@ LOGS = ROOT / "logs"
 REPORTS = ROOT / "reports"
 KUBECONFIG = STATE / "kubeconfig"
 IPS_FILE = STATE / "node_ips.json"
+CONTEXT_STATE = STATE / "context_registration.json"
 PREP = ROOT / "scripts" / "guest" / "prepare-node.sh"
+VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 
 
 class LabError(Exception):
@@ -39,6 +43,10 @@ class LabError(Exception):
 
 def out(message: str) -> None:
     print(message, flush=True)
+
+
+def next_step(command: str, reason: str) -> None:
+    out(f"NEXT: `{command}` - {reason}")
 
 
 def write_secret(path: Path, data: str) -> None:
@@ -54,7 +62,7 @@ def call(args: list[str], *, input_text: str | None = None,
          env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     try:
         p = subprocess.run(args, input=input_text, text=True,
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           capture_output=True,
                            timeout=timeout, env=env)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise LabError(f"Command failed: {args[0]}: {exc}") from exc
@@ -69,22 +77,58 @@ def cmd_output(args: list[str], timeout: int = 30) -> str:
     return call(args, timeout=timeout).stdout.strip()
 
 
+def client_kubeconfig_path(explicit: Path | None = None) -> Path:
+    if explicit:
+        return explicit.expanduser().resolve()
+    configured = os.environ.get("KUBECONFIG")
+    if configured:
+        first = configured.split(os.pathsep)[0]
+        if first:
+            return Path(first).expanduser().resolve()
+    return Path("~/.kube/config").expanduser().resolve()
+
+
 class Lab:
     def __init__(self, config_file: Path = CONFIG_FILE):
-        if sys.version_info < (3, 11):
-            raise LabError("Python >= 3.11 required; try `brew install python`.")
         with config_file.open("rb") as f:
             config = tomllib.load(f)
         self.cluster = config["cluster"]
         self.net = config["network"]
         self.vms = config["vm"]
         self.name = self.cluster["name"]
-        self.cp = next((name for name, info in self.vms.items()
-                        if info["role"] == "control-plane"), None)
+        if self.net.get("mode") != "softnet":
+            raise LabError("network.mode must be 'softnet'; no other network backend is supported")
+        for field in ("softnet_bin", "socket_path"):
+            configured_path = Path(self.net.get(field, "")).expanduser()
+            if not configured_path.is_absolute():
+                raise LabError(f"network.{field} must be an absolute path")
+        aliases = self.cluster.get("cli_aliases", [])
+        if not isinstance(aliases, list) or not all(isinstance(item, str) for item in aliases):
+            raise LabError("cluster.cli_aliases must be an array of command-name strings")
+        invalid_aliases = [item for item in aliases
+                           if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", item)]
+        if invalid_aliases:
+            raise LabError("Unsafe CLI alias name(s): " + ", ".join(repr(item) for item in invalid_aliases))
+        if "k8sctl" in aliases:
+            raise LabError("cluster.cli_aliases must not include the primary command name 'k8sctl'")
+        if len(set(aliases)) != len(aliases):
+            raise LabError("cluster.cli_aliases contains duplicate command names")
+        self.cli_aliases = aliases
+        roles = {name: info.get("role") for name, info in self.vms.items()}
+        invalid_roles = {name: role for name, role in roles.items()
+                         if role not in {"control-plane", "worker"}}
+        if invalid_roles:
+            details = ", ".join(f"{name}={role!r}" for name, role in invalid_roles.items())
+            raise LabError(f"Invalid VM role(s): {details}")
+        control_planes = [name for name, role in roles.items()
+                          if role == "control-plane"]
+        if len(control_planes) != 1:
+            raise LabError("Configure exactly one control-plane VM.")
+        self.cp = control_planes[0]
         self.workers = [name for name, info in self.vms.items()
                         if info["role"] == "worker"]
-        if not self.cp or not self.workers:
-            raise LabError("Configure one control plane and at least one worker.")
+        if not self.workers:
+            raise LabError("Configure at least one worker VM.")
         subnet = ipaddress.ip_network(self.net["subnet"], strict=False)
         if subnet.version != 4:
             raise LabError("VM subnet must be IPv4.")
@@ -93,14 +137,34 @@ class Lab:
         svc = ipaddress.ip_network(self.cluster["service_cidr"])
         if pod.overlaps(subnet) or svc.overlaps(subnet) or pod.overlaps(svc):
             raise LabError("VM, pod, and service networks must not overlap.")
+        flannel_sha256 = self.cluster.get("flannel_sha256", "")
+        if not re.fullmatch(r"[0-9a-f]{64}", flannel_sha256):
+            raise LabError("cluster.flannel_sha256 must be a lowercase SHA-256 digest")
+        key_sha256 = self.cluster.get("kubernetes_release_key_sha256", "")
+        if not re.fullmatch(r"[0-9a-f]{64}", key_sha256):
+            raise LabError("cluster.kubernetes_release_key_sha256 must be a lowercase SHA-256 digest")
+        image = self.cluster["ubuntu_image"]
+        if "/" in image and not re.fullmatch(r".+@sha256:[0-9a-f]{64}", image):
+            raise LabError("Remote cluster.ubuntu_image must be pinned by SHA-256 digest")
         self.key = Path(self.cluster["ssh_private_key"]).expanduser()
         self.ssh_user = self.cluster["ssh_user"]
+        reserved: dict[ipaddress.IPv4Address, str] = {}
+        gateway = ipaddress.ip_address(self.net["gateway"])
+        if gateway not in subnet:
+            raise LabError(f"Gateway {gateway} is outside {subnet}")
         for n, info in self.vms.items():
             if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", n):
                 raise LabError(f"Unsafe VM name: {n}")
             desired = info.get("reserved_ip", "")
-            if desired and ipaddress.ip_address(desired) not in subnet:
-                raise LabError(f"Reserved IP {desired} for {n} outside {subnet}")
+            if desired:
+                address = ipaddress.ip_address(desired)
+                if address not in subnet:
+                    raise LabError(f"Reserved IP {desired} for {n} outside {subnet}")
+                if address in {subnet.network_address, subnet.broadcast_address, gateway}:
+                    raise LabError(f"Reserved IP {desired} for {n} is not a usable node address")
+                if address in reserved:
+                    raise LabError(f"Duplicate reserved IP {desired} for {reserved[address]} and {n}")
+                reserved[address] = n
         for directory in (STATE, LOGS, REPORTS):
             directory.mkdir(exist_ok=True, mode=0o700)
         os.chmod(STATE, 0o700)
@@ -112,7 +176,7 @@ class Lab:
         env["SOCKET_VMNET_PATH"] = self.net["socket_path"]
         return env
 
-    def preflight(self, strict: bool = True) -> bool:
+    def preflight(self, strict: bool = True, show_next_steps: bool = True) -> bool:
         out("==> Host / shim / socket preflight (read-only)")
         errors = []
         for executable in ("tart", "ssh", "scp"):
@@ -158,6 +222,9 @@ class Lab:
                 raise LabError("Preflight failed; fix the above without changing your working shim setup.")
         else:
             out("  Preflight OK")
+            if show_next_steps:
+                next_step("k8sctl create", "for a fresh lab, create the configured VM disks")
+                next_step("k8sctl status", "for an existing lab, inspect its current state first")
         return not errors
 
     def vm_info(self, name: str) -> dict | None:
@@ -169,24 +236,42 @@ class Lab:
         except ValueError as exc:
             raise LabError(f"Could not read Tart info for {name}: {exc}") from exc
 
-    def create(self) -> None:
-        self.preflight()
+    def create(self, show_next_steps: bool = True, check_preflight: bool = True) -> None:
+        if check_preflight:
+            self.preflight(show_next_steps=False)
         for name, vm in self.vms.items():
-            if self.vm_info(name) is not None:
+            info = self.vm_info(name)
+            if info is not None:
                 out(f"SKIP {name}: VM already exists; not changing its resources")
+                expected = {"CPU": vm["cpu"], "Memory": vm["memory_mib"],
+                            "Disk": vm["disk_gib"]}
+                differences = [f"{field}={info.get(field)!r} (configured {value!r})"
+                               for field, value in expected.items()
+                               if info.get(field) is not None and info.get(field) != value]
+                if differences:
+                    out("  WARN: existing VM resource mismatch: " + ", ".join(differences))
                 continue
             image = self.cluster["ubuntu_image"]
             out(f"==> Clone {image} -> {name}")
             call(["tart", "clone", image, name], timeout=1800)
-            call(["tart", "set", name,
-                  "--cpu", str(vm["cpu"]),
-                  "--memory", str(vm["memory_mib"]),
-                  "--disk-size", str(vm["disk_gib"])], timeout=60)
+            try:
+                call(["tart", "set", name,
+                      "--cpu", str(vm["cpu"]),
+                      "--memory", str(vm["memory_mib"]),
+                      "--disk-size", str(vm["disk_gib"])], timeout=60)
+            except LabError as exc:
+                raise LabError(
+                    f"VM {name} was cloned but resource configuration failed. "
+                    f"Inspect it with `tart get {name}` and either configure it manually "
+                    f"or delete only that incomplete VM before retrying: {exc}"
+                ) from exc
             out(f"Created {name}")
+        if show_next_steps:
+            next_step("k8sctl start", "boot the VMs, discover their addresses, and check whether guest access is ready")
 
-    def start(self, check_preflight: bool = True) -> None:
+    def start(self, check_preflight: bool = True, show_next_steps: bool = True) -> None:
         if check_preflight:
-            self.preflight()
+            self.preflight(show_next_steps=False)
         for name in self.vms:
             info = self.vm_info(name)
             if info is None:
@@ -204,7 +289,22 @@ class Lab:
         # Check for changed IPs after all machines have had time to start.
         ips = self.discover_ips()
         self.guard_ips(ips)
-        out("All VM addresses discovered. Run `status` or `up`.")
+        if not show_next_steps:
+            return
+        issues = self.access_issues(ips)
+        if issues:
+            out("All VM addresses discovered, but guest access is not ready:")
+            for name, issue in issues.items():
+                out(f"  {name}: {issue}")
+            next_step("k8sctl access", "REQUIRED: install the SSH key and lab-only passwordless sudo interactively")
+            out("WHY: `k8sctl up` must administer each guest non-interactively; enter the VM password when prompted.")
+        else:
+            out("All VM addresses discovered; SSH keys and passwordless sudo are ready.")
+            if KUBECONFIG.exists():
+                next_step("k8sctl status", "verify the restarted cluster and check for IP drift or unhealthy nodes")
+                out("THEN: run `k8sctl test` if you want an end-to-end post-restart validation.")
+            else:
+                next_step("k8sctl up", "SSH and sudo are ready, so Kubernetes provisioning can run unattended")
 
     def discover_ips(self) -> dict[str, str]:
         timeout = int(self.cluster["ip_wait_seconds"])
@@ -257,7 +357,7 @@ class Lab:
     def save_ips(self, ips: dict[str, str]) -> None:
         write_secret(IPS_FILE, json.dumps({
             "cluster": self.name,
-            "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "recorded_at": dt.datetime.now(dt.UTC).isoformat(),
             "ips": ips}, indent=2) + "\n")
 
     def ssh_base(self, ip: str, *, interactive: bool = False,
@@ -290,12 +390,24 @@ class Lab:
                 time.sleep(4)
             else:
                 raise LabError(f"Cannot SSH as {self.ssh_user}@{ip}. "
-                               "Run `python3 k8sctl.py access` once, or configure keys manually.")
+                               "Run `k8sctl access` once, or configure keys manually.")
             check = self.ssh(ip, "sudo -n true", check=False)
             if check.returncode:
                 raise LabError(f"Passwordless sudo unavailable on {name}. "
-                               "Run `python3 k8sctl.py access` (lab-only sudoers), then retry.")
+                               "Run `k8sctl access` (lab-only sudoers), then retry.")
             out(f"SSH and sudo OK: {name} ({ip})")
+
+    def access_issues(self, ips: dict[str, str]) -> dict[str, str]:
+        issues = {}
+        for name, ip in ips.items():
+            key_check = self.ssh(ip, "true", check=False, timeout=12)
+            if key_check.returncode:
+                issues[name] = "SSH key login unavailable"
+                continue
+            sudo_check = self.ssh(ip, "sudo -n true", check=False, timeout=12)
+            if sudo_check.returncode:
+                issues[name] = "passwordless sudo unavailable"
+        return issues
 
     def access(self) -> None:
         """Intentional one-time interactive credential bootstrap for isolated lab."""
@@ -320,11 +432,16 @@ class Lab:
             # sudo command is visibly interactive and affects this lab VM only.
             rule = f"{self.ssh_user} ALL=(ALL) NOPASSWD: ALL"
             filename = "/etc/sudoers.d/95-k8s-tart-lab"
-            inner = f"printf '%s\\n' {shlex.quote(rule)} > {filename} && chmod 440 {filename} && visudo -c -f {filename}"
+            inner = (f"printf '%s\\n' {shlex.quote(rule)} > {filename} && "
+                     f"chmod 440 {filename} && visudo -c -f {filename}")
             out(f"==> Configure lab-only passwordless sudo on {name}; enter VM password if asked")
             subprocess.run(self.ssh_base(ip, interactive=True) +
                            ["sudo sh -c " + shlex.quote(inner)], check=True)
         out("Lab SSH/sudo access prepared. Do not use this lab sudo policy on production hosts.")
+        if self.node_file(ips[self.cp], "/etc/kubernetes/admin.conf"):
+            next_step("k8sctl adopt", "the control plane already exists; import it without rebuilding Kubernetes")
+        else:
+            next_step("k8sctl up", "provision Linux prerequisites, kubeadm, Flannel, and worker membership")
 
     def connectivity(self, ips: dict[str, str]) -> None:
         for name, ip in ips.items():
@@ -350,7 +467,8 @@ class Lab:
                 continue
             out(f"==> Initial guest preparation: {name} (may download APT packages)")
             invocation = (f"sudo -n bash -s -- {shlex.quote(name)} "
-                          f"{shlex.quote(self.cluster['kubernetes_minor'])}")
+                          f"{shlex.quote(self.cluster['kubernetes_minor'])} "
+                          f"{shlex.quote(self.cluster['kubernetes_release_key_sha256'])}")
             result = self.ssh(ip, invocation, stdin=body, timeout=1800)
             out(result.stdout[-1500:])
 
@@ -366,7 +484,8 @@ class Lab:
             is_ip = False
         if is_ip and endpoint != ip:
             raise LabError(f"Kubeadm admin.conf endpoint {endpoint} != current control-plane IP {ip}. "
-                           "Refusing automatic repair/re-init; restore original DHCP reservation or follow disaster recovery steps.")
+                           "Refusing automatic repair/re-init; restore the original DHCP reservation "
+                           "or follow disaster recovery steps.")
 
     def sync_kubeconfig(self, cp_ip: str) -> None:
         self.validate_api_endpoint(cp_ip)
@@ -387,9 +506,178 @@ class Lab:
         return call(["kubectl", *arguments], input_text=input_text,
                     timeout=timeout, check=check, env=env)
 
-    def bootstrap_control_plane(self, ips: dict[str, str]) -> None:
+    def kubeconfig_data(self, path: Path) -> dict:
+        if not path.is_file():
+            return {"apiVersion": "v1", "kind": "Config", "clusters": [],
+                    "users": [], "contexts": [], "current-context": ""}
+        result = call(["kubectl", "--kubeconfig", str(path), "config", "view",
+                       "--raw", "--flatten", "-o", "json"], timeout=30)
+        try:
+            return json.loads(result.stdout)
+        except ValueError as exc:
+            raise LabError(f"Could not parse kubeconfig {path}: {exc}") from exc
+
+    @staticmethod
+    def named_entry(data: dict, section: str, name: str) -> dict:
+        for entry in data.get(section, []):
+            if entry.get("name") == name:
+                return entry
+        raise LabError(f"Kubeconfig entry {section}/{name} was not found")
+
+    def context_registration(self) -> dict:
+        if not CONTEXT_STATE.exists():
+            return {}
+        try:
+            return json.loads(CONTEXT_STATE.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise LabError(f"Invalid context registration state {CONTEXT_STATE}: {exc}") from exc
+
+    @staticmethod
+    def backup_kubeconfig(target: Path) -> Path | None:
+        if not target.exists():
+            return None
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup = target.with_name(f"{target.name}.bak.{stamp}")
+        shutil.copy2(target, backup)
+        os.chmod(backup, 0o600)
+        return backup
+
+    def install_context(self, name: str, target: Path, *, activate: bool) -> None:
+        if not KUBECONFIG.exists():
+            raise LabError("No lab kubeconfig. Run `k8sctl adopt` first.")
+        if not shutil.which("kubectl"):
+            raise LabError("Local kubectl unavailable. Run `brew install kubectl`.")
+        source = self.kubeconfig_data(KUBECONFIG)
+        source_context_name = source.get("current-context")
+        if not source_context_name:
+            raise LabError(f"Lab kubeconfig {KUBECONFIG} has no current context")
+        source_context = self.named_entry(source, "contexts", source_context_name)["context"]
+        source_cluster = self.named_entry(source, "clusters", source_context["cluster"])["cluster"]
+        source_user = self.named_entry(source, "users", source_context["user"])["user"]
+
+        target_data = self.kubeconfig_data(target)
+        registration = self.context_registration()
+        existing_names = {
+            item.get("name")
+            for section in ("contexts", "clusters", "users")
+            for item in target_data.get(section, [])
+        }
+        registered_here = (registration.get("name") == name and
+                           registration.get("target") == str(target))
+        if name in existing_names and not registered_here:
+            raise LabError(
+                f"Context {name!r} already exists in {target} and is not managed by k8sctl. "
+                "Choose another name with `--name`."
+            )
+
+        previous = registration.get("previous_context") if registered_here else target_data.get("current-context", "")
+        renamed_context = dict(source_context)
+        renamed_context["cluster"] = name
+        renamed_context["user"] = name
+        candidate = {
+            "apiVersion": "v1", "kind": "Config", "preferences": {},
+            "clusters": [{"name": name, "cluster": source_cluster}],
+            "users": [{"name": name, "user": source_user}],
+            "contexts": [{"name": name, "context": renamed_context}],
+            "current-context": name if activate else "",
+        }
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(target.parent, 0o700)
+        temporary = tempfile.NamedTemporaryFile(prefix="k8sctl-context-", suffix=".json",
+                                                 dir=STATE, delete=False)
+        temporary_path = Path(temporary.name)
+        temporary.close()
+        try:
+            write_secret(temporary_path, json.dumps(candidate) + "\n")
+            sources = [str(temporary_path)]
+            if target.is_file():
+                sources.append(str(target))
+            env = os.environ.copy()
+            env["KUBECONFIG"] = os.pathsep.join(sources)
+            merged = call(["kubectl", "config", "view", "--raw", "--flatten", "-o", "json"],
+                          env=env, timeout=30).stdout
+            json.loads(merged)
+            backup = self.backup_kubeconfig(target)
+            write_secret(target, merged.rstrip() + "\n")
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        write_secret(CONTEXT_STATE, json.dumps({
+            "name": name,
+            "target": str(target),
+            "previous_context": previous,
+            "installed_at": dt.datetime.now(dt.UTC).isoformat(),
+        }, indent=2) + "\n")
+        action = "installed and activated" if activate else "installed"
+        out(f"Context {name!r} {action} in {target}")
+        if backup:
+            out(f"Previous kubeconfig backed up to {backup}")
+        if activate:
+            next_step("k8sctl test", "validate cross-node networking, DNS, and Service routing")
+        else:
+            next_step(f"kubectl config use-context {name}", "select the installed lab context when you are ready")
+
+    def remove_context(self, name: str, target: Path) -> None:
+        registration = self.context_registration()
+        if registration.get("name") != name or registration.get("target") != str(target):
+            raise LabError(f"Context {name!r} in {target} is not registered as managed by k8sctl")
+        if not target.is_file():
+            raise LabError(f"Registered client kubeconfig is missing: {target}")
+        data = self.kubeconfig_data(target)
+        data["contexts"] = [item for item in data.get("contexts", []) if item.get("name") != name]
+        data["clusters"] = [item for item in data.get("clusters", []) if item.get("name") != name]
+        data["users"] = [item for item in data.get("users", []) if item.get("name") != name]
+        if data.get("current-context") == name:
+            previous = registration.get("previous_context", "")
+            available = {item.get("name") for item in data.get("contexts", [])}
+            data["current-context"] = previous if previous in available else ""
+        backup = self.backup_kubeconfig(target)
+        write_secret(target, json.dumps(data, indent=2) + "\n")
+        CONTEXT_STATE.unlink(missing_ok=True)
+        out(f"Removed managed context {name!r} from {target}")
+        if backup:
+            out(f"Previous kubeconfig backed up to {backup}")
+        if data.get("current-context"):
+            out(f"Restored current context: {data['current-context']}")
+
+    def context(self, action: str, name: str | None, target: Path | None) -> None:
+        name = name or self.name
+        destination = client_kubeconfig_path(target)
+        if destination == KUBECONFIG.resolve():
+            raise LabError(
+                "The client context target resolves to the isolated lab kubeconfig. "
+                "Use `--target ~/.kube/config` to register it with normal kubectl contexts."
+            )
+        if action == "install":
+            self.install_context(name, destination, activate=False)
+        elif action == "use":
+            self.install_context(name, destination, activate=True)
+        elif action == "remove":
+            self.remove_context(name, destination)
+        else:
+            if not destination.exists():
+                out(f"Client kubeconfig does not exist: {destination}")
+                next_step(f"k8sctl context use --name {name}",
+                          "create the client kubeconfig and activate the lab context")
+                return
+            result = call(["kubectl", "--kubeconfig", str(destination), "config",
+                           "get-contexts", name], check=False, timeout=20)
+            if result.returncode or len(result.stdout.strip().splitlines()) < 2:
+                out(f"Context {name!r} is not installed in {destination}")
+                next_step(f"k8sctl context use --name {name}",
+                          "install and select the lab credentials for normal kubectl commands")
+            else:
+                out(result.stdout.strip())
+                context_line = result.stdout.strip().splitlines()[1].lstrip()
+                if context_line.startswith("*"):
+                    next_step("k8sctl test", "the lab context is active; validate the cluster data plane")
+                else:
+                    next_step(f"kubectl config use-context {name}",
+                              "select the installed lab context before using normal kubectl commands")
+
+    def bootstrap_control_plane(self, ips: dict[str, str]) -> bool:
         cp_ip = ips[self.cp]
-        if self.node_file(cp_ip, "/etc/kubernetes/admin.conf"):
+        initialized = self.node_file(cp_ip, "/etc/kubernetes/admin.conf")
+        if initialized:
             out("SKIP: control plane already initialized; will NOT re-run kubeadm init")
         else:
             out(f"==> kubeadm init: {self.cp} {cp_ip}")
@@ -397,15 +685,18 @@ class Lab:
                     f"--apiserver-advertise-address={cp_ip}",
                     f"--pod-network-cidr={self.cluster['pod_cidr']}",
                     f"--service-cidr={self.cluster['service_cidr']}",
+                    "--skip-token-print",
                     "--cri-socket=unix:///run/containerd/containerd.sock"]
             result = self.ssh(cp_ip, shlex.join(opts), timeout=1800)
             out(result.stdout[-3000:])
         self.sync_kubeconfig(cp_ip)
         out("==> Testing Kubernetes API")
         out(self.kctl("get", "nodes", "-o", "wide", timeout=45).stdout)
+        return not initialized
 
     def flannel_manifest(self) -> str:
         version = self.cluster["flannel_version"]
+        expected_sha256 = self.cluster["flannel_sha256"]
         if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", version):
             raise LabError(f"Invalid Flannel version: {version}")
         path = ROOT / "vendor" / f"kube-flannel-{version}.yml"
@@ -414,23 +705,99 @@ class Lab:
             out(f"==> Downloading pinned Flannel manifest: {url}")
             try:
                 with urllib.request.urlopen(url, timeout=60) as response:
-                    data = response.read(1_000_000).decode("utf-8")
+                    data = response.read(1_000_001)
             except Exception as exc:
                 raise LabError(f"Could not download Flannel release manifest: {exc}") from exc
-            if "kind: DaemonSet" not in data or "kube-flannel" not in data:
+            if len(data) > 1_000_000:
+                raise LabError("Flannel manifest exceeds the 1 MB safety limit")
+            actual_sha256 = hashlib.sha256(data).hexdigest()
+            if actual_sha256 != expected_sha256:
+                raise LabError(
+                    f"Flannel manifest SHA-256 mismatch: expected {expected_sha256}, "
+                    f"received {actual_sha256}"
+                )
+            decoded = data.decode("utf-8")
+            if "kind: DaemonSet" not in decoded or "kube-flannel" not in decoded:
                 raise LabError("Downloaded Flannel manifest did not pass sanity check")
-            path.write_text(data, encoding="utf-8")
-        content = path.read_text(encoding="utf-8")
+            path.write_bytes(data)
+        cached = path.read_bytes()
+        actual_sha256 = hashlib.sha256(cached).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise LabError(
+                f"Cached Flannel manifest SHA-256 mismatch: expected {expected_sha256}, "
+                f"received {actual_sha256}. Remove {path} and retry."
+            )
+        content = cached.decode("utf-8")
         default = '"Network": "10.244.0.0/16"'
         if default not in content:
             raise LabError("Unexpected Flannel manifest format; cannot safely patch Pod network")
         return content.replace(default, f'"Network": "{self.cluster["pod_cidr"]}"')
 
-    def apply_cni(self) -> None:
-        result = self.kctl("get", "namespace", "kube-flannel", check=False)
-        if result.returncode == 0:
-            out("SKIP: kube-flannel namespace already exists; existing CNI left unchanged")
+    def validate_cluster_networks(self) -> None:
+        pod_network = ipaddress.ip_network(self.cluster["pod_cidr"])
+        nodes = self.kctl("get", "nodes", "-o", "json", timeout=45)
+        try:
+            node_data = json.loads(nodes.stdout)
+        except ValueError as exc:
+            raise LabError(f"Could not inspect existing node Pod CIDRs: {exc}") from exc
+        for item in node_data.get("items", []):
+            name = item.get("metadata", {}).get("name", "unknown")
+            cidrs = item.get("spec", {}).get("podCIDRs") or []
+            if not cidrs and item.get("spec", {}).get("podCIDR"):
+                cidrs = [item["spec"]["podCIDR"]]
+            for cidr in cidrs:
+                network = ipaddress.ip_network(cidr)
+                if network.version != pod_network.version or not network.subnet_of(pod_network):
+                    raise LabError(
+                        f"Existing node {name} Pod CIDR {network} is outside configured "
+                        f"cluster.pod_cidr {pod_network}; refusing CNI changes."
+                    )
+        service_ip = self.kctl("get", "service", "kubernetes", "-n", "default",
+                               "-o", "jsonpath={.spec.clusterIP}", timeout=30).stdout.strip()
+        service_network = ipaddress.ip_network(self.cluster["service_cidr"])
+        if service_ip and ipaddress.ip_address(service_ip) not in service_network:
+            raise LabError(
+                f"Existing kubernetes Service IP {service_ip} is outside configured "
+                f"cluster.service_cidr {service_network}; refusing CNI changes."
+            )
+
+    def apply_cni(self, *, newly_initialized: bool) -> None:
+        self.validate_cluster_networks()
+        daemonsets = self.kctl("get", "daemonsets", "-A", "-o", "json", timeout=45)
+        try:
+            ds_data = json.loads(daemonsets.stdout)
+        except ValueError as exc:
+            raise LabError(f"Could not inspect existing CNI DaemonSets: {exc}") from exc
+        items = ds_data.get("items", [])
+        cni_markers = ("calico", "cilium", "weave", "antrea", "canal", "kube-router")
+        other_cni = []
+        flannel_exists = False
+        for item in items:
+            metadata = item.get("metadata", {})
+            if (metadata.get("namespace") == "kube-flannel" and
+                    metadata.get("name") == "kube-flannel-ds"):
+                flannel_exists = True
+            containers = item.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+            identity = " ".join([
+                metadata.get("namespace", ""), metadata.get("name", ""),
+                *(container.get("image", "") for container in containers),
+            ]).lower()
+            if any(marker in identity for marker in cni_markers):
+                other_cni.append(f"{metadata.get('namespace')}/{metadata.get('name')}")
+        if other_cni:
+            raise LabError("Existing non-Flannel CNI detected: " + ", ".join(other_cni) +
+                           ". Refusing to install a second CNI.")
+        if flannel_exists:
+            out("SKIP: existing kube-flannel DaemonSet left unchanged")
             return
+        namespace = self.kctl("get", "namespace", "kube-flannel", check=False)
+        if namespace.returncode == 0:
+            raise LabError(
+                "kube-flannel namespace exists but kube-flannel-ds is missing. "
+                "Refusing to overwrite a partial or manually managed CNI installation."
+            )
+        if not newly_initialized:
+            out("No existing CNI DaemonSet detected; installing configured Flannel after network validation")
         out("==> Installing Flannel CNI")
         manifest = self.flannel_manifest()
         out(self.kctl("apply", "-f", "-", input_text=manifest, timeout=180).stdout)
@@ -446,13 +813,40 @@ class Lab:
         tokens = shlex.split(command)
         if not tokens or tokens[0] != "kubeadm" or "join" not in tokens:
             raise LabError("Unexpected kubeadm token command; refusing worker join")
+        token = ""
+        if "--token" in tokens:
+            index = tokens.index("--token")
+            if index + 1 < len(tokens):
+                token = tokens[index + 1]
         # Do NOT print the bootstrap token. Do not persist it in state/reports.
-        for name in new_workers:
-            out(f"==> Joining worker {name} ({ips[name]})")
-            args = ["sudo", "-n", *tokens,
-                    "--cri-socket=unix:///run/containerd/containerd.sock"]
-            result = self.ssh(ips[name], shlex.join(args), timeout=900)
-            out(result.stdout[-1000:])
+        try:
+            for name in new_workers:
+                out(f"==> Joining worker {name} ({ips[name]})")
+                args = ["sudo", "-n", *tokens,
+                        "--cri-socket=unix:///run/containerd/containerd.sock"]
+                result = self.ssh(ips[name], shlex.join(args), timeout=900)
+                out(result.stdout[-1000:])
+        finally:
+            if re.fullmatch(r"[a-z0-9]{6}\.[a-z0-9]{16}", token):
+                self.ssh(ips[self.cp],
+                         "sudo -n kubeadm token delete " + shlex.quote(token),
+                         check=False, timeout=30)
+
+    def revoke_bootstrap_tokens(self, cp_ip: str) -> None:
+        result = self.ssh(cp_ip, "sudo -n kubeadm token list", check=False, timeout=30)
+        if result.returncode:
+            out("WARN: could not list temporary kubeadm bootstrap tokens for cleanup")
+            return
+        tokens = []
+        for line in result.stdout.splitlines()[1:]:
+            fields = line.split()
+            if fields and re.fullmatch(r"[a-z0-9]{6}\.[a-z0-9]{16}", fields[0]):
+                tokens.append(fields[0])
+        for token in tokens:
+            self.ssh(cp_ip, "sudo -n kubeadm token delete " + shlex.quote(token),
+                     check=False, timeout=30)
+        if tokens:
+            out(f"Revoked {len(tokens)} temporary kubeadm bootstrap token(s)")
 
     def adopt(self) -> None:
         """Never mutates VM configuration or existing Kubernetes resources."""
@@ -466,28 +860,33 @@ class Lab:
         out(self.kctl("get", "nodes", "-o", "wide").stdout)
         self.save_ips(ips)
         out("Adopted existing cluster without rebuilding or changing nodes/networking.")
+        next_step("k8sctl context use", "merge and select the lab context for normal kubectl commands")
 
     def up(self) -> None:
-        self.preflight()
+        self.preflight(show_next_steps=False)
         if not shutil.which("kubectl"):
             raise LabError("Install macOS kubectl (`brew install kubectl`) before running `up`.")
-        self.create()
-        self.start(check_preflight=False)
+        self.create(show_next_steps=False, check_preflight=False)
+        self.start(check_preflight=False, show_next_steps=False)
         ips = self.discover_ips()
         self.guard_ips(ips)
         self.wait_ssh(ips)
         self.connectivity(ips)
         self.prepare(ips)
-        self.bootstrap_control_plane(ips)
-        self.apply_cni()
+        newly_initialized = self.bootstrap_control_plane(ips)
+        self.apply_cni(newly_initialized=newly_initialized)
         self.join_workers(ips)
+        if newly_initialized:
+            self.revoke_bootstrap_tokens(ips[self.cp])
         self.save_ips(ips)
         out("==> Waiting for node Ready conditions (up to 5 minutes)")
         self.kctl("wait", "--for=condition=Ready", "nodes", "--all", "--timeout=300s", timeout=330)
         out(self.kctl("get", "nodes", "-o", "wide").stdout)
-        out("UP completed. Next: `python3 k8sctl.py test`.")
+        out("UP completed: all configured Kubernetes nodes are Ready.")
+        next_step("k8sctl context use", "install and select the refreshed lab credentials in your client kubeconfig")
+        out("THEN: run `k8sctl test` to validate Pod networking, DNS, and Service routing.")
 
-    def stop(self) -> None:
+    def stop(self, show_next_steps: bool = True) -> None:
         for name in [*self.workers, self.cp]:
             info = self.vm_info(name)
             if info and info.get("Running"):
@@ -495,6 +894,8 @@ class Lab:
                 call(["tart", "stop", name], timeout=90)
             else:
                 out(f"SKIP {name}: absent or already stopped")
+        if show_next_steps:
+            next_step("k8sctl start", "restart the retained VM disks and verify IP/access readiness")
 
     def status(self) -> None:
         out(f"Cluster: {self.name}\nVM network: {self.subnet}")
@@ -520,10 +921,11 @@ class Lab:
             out("\nNon-running Kubernetes Pods (may include completed Jobs):\n" +
                 (p.stdout.strip() or p.stderr.strip()))
         else:
-            out("No local kubeconfig/kubectl; run `adopt` once after setting up access.")
+            out("No local kubeconfig/kubectl. For an existing cluster run `adopt`; "
+                "for fresh VMs complete `access` and `up`.")
 
     def doctor(self) -> None:
-        self.preflight(strict=False)
+        self.preflight(strict=False, show_next_steps=False)
         self.status()
         out("\n==> Diagnostics (read-only)")
         ips = {}
@@ -549,15 +951,20 @@ class Lab:
                 if worker not in ips:
                     continue
                 probe = "python3 -c " + shlex.quote(
-                    f"import socket; socket.create_connection(('{ips[self.cp]}', 6443), 4).close(); print('API TCP reachable')")
+                    "import socket; "
+                    f"socket.create_connection(('{ips[self.cp]}', 6443), 4).close(); "
+                    "print('API TCP reachable')")
                 p = self.ssh(ips[worker], probe, check=False)
                 out(f"{worker} -> {self.cp}:6443: " +
                     (p.stdout.strip() if p.returncode == 0 else "FAILED " + p.stderr.strip()[-300:]))
-        if KUBECONFIG.exists():
+        if KUBECONFIG.exists() and shutil.which("kubectl"):
             for args in [("get", "pods", "-n", "kube-flannel", "-o", "wide"),
                          ("get", "pods", "-n", "kube-system", "-o", "wide")]:
                 p = self.kctl(*args, check=False, timeout=20)
                 out("kubectl " + " ".join(args) + "\n" + (p.stdout or p.stderr).strip())
+        elif KUBECONFIG.exists():
+            out("Skipping Kubernetes diagnostics: local kubectl is unavailable")
+        next_step("k8sctl diagnose", "capture a timestamped diagnostic bundle if deeper troubleshooting is needed")
 
     def diagnose(self) -> None:
         timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -593,7 +1000,7 @@ sudo -n ss -lntup
 """
             p = self.ssh(ip, "bash -s", stdin=diagnostics, check=False, timeout=90)
             write_secret(directory / f"guest-{name}.txt", p.stdout + "\n" + p.stderr)
-        if KUBECONFIG.exists():
+        if KUBECONFIG.exists() and shutil.which("kubectl"):
             commands = [
                 ("k8s-nodes.txt", ["get", "nodes", "-o", "wide"]),
                 ("k8s-all-pods.txt", ["get", "pods", "-A", "-o", "wide"]),
@@ -608,9 +1015,14 @@ sudo -n ss -lntup
                           "--all-containers=true", "--tail=120", "--max-log-requests=10",
                           check=False, timeout=45)
             write_secret(directory / "flannel-logs.txt", p.stdout + "\n" + p.stderr)
+        elif KUBECONFIG.exists():
+            write_secret(directory / "k8s-skipped.txt",
+                         "Kubernetes diagnostics skipped: local kubectl is unavailable.\n")
         out("Diagnostic bundle saved. Treat logs as potentially sensitive; review before sharing.")
 
     def test(self, keep: bool = False) -> None:
+        if len(self.workers) < 2:
+            raise LabError("Cross-node smoke test requires at least two configured worker VMs.")
         self.kctl("get", "nodes", timeout=20)
         namespace = "k8s-tart-smoke"
         existing = self.kctl("get", "ns", namespace, check=False)
@@ -653,6 +1065,7 @@ sudo -n ss -lntup
                 out("Smoke test namespace delete requested: " + (p.stdout or p.stderr).strip())
             else:
                 out(f"Smoke test namespace kept: {namespace} (manual cleanup: kubectl delete ns {namespace})")
+        next_step("k8sctl status", "confirm nodes remain Ready and no non-running Pods remain")
 
     def monitor(self, interval: int, count: int) -> None:
         index = 0
@@ -689,10 +1102,11 @@ ip link delete flannel.1 2>/dev/null || true
         if KUBECONFIG.exists():
             KUBECONFIG.unlink()
         out("Kubernetes reset requested. VM OS, containerd, apt packages and shim are retained.")
+        next_step("k8sctl up", "reinitialize Kubernetes on the retained, already accessible VMs")
 
     def destroy(self, yes: bool, phrase: str | None) -> None:
         self.confirmation(yes, phrase, "destroy")
-        self.stop()
+        self.stop(show_next_steps=False)
         for name in self.vms:
             if self.vm_info(name) is None:
                 continue
@@ -703,18 +1117,21 @@ ip link delete flannel.1 2>/dev/null || true
         if IPS_FILE.exists():
             IPS_FILE.unlink()
         out("VMs deleted. Existing socket_vmnet daemon, softnet shim, logs and reports were NOT touched.")
+        next_step("k8sctl create", "begin a fresh provisioning test by cloning and sizing new VM disks")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("--config", type=Path, default=CONFIG_FILE,
                         help="TOML configuration (default: config/cluster.toml)")
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(dest="command")
     for command, help_text in [
         ("preflight", "Read-only host/shim/socket checks"),
         ("access", "Interactive one-time SSH key and lab sudo setup"),
         ("adopt", "Inspect and register existing working Kubernetes cluster (no mutation)"),
+        ("context", "Install, select, inspect, or remove the lab kubectl context"),
         ("create", "Create only missing Tart VMs; never change existing ones"),
         ("start", "Start existing VMs using the shim; block on IP drift"),
         ("up", "Idempotent-ish fresh provision/reconcile; preserve existing kubeadm state"),
@@ -730,6 +1147,14 @@ def main() -> int:
         command_parser = commands.add_parser(command, help=help_text)
         if command == "test":
             command_parser.add_argument("--keep", action="store_true", help="Keep smoke test namespace")
+        if command == "context":
+            command_parser.add_argument("action", nargs="?", default="status",
+                                        choices=("status", "install", "use", "remove"))
+            command_parser.add_argument("--name",
+                                        help="Context/cluster/user name (default: cluster.name from config)")
+            command_parser.add_argument("--target", type=Path,
+                                        help="Client kubeconfig to update "
+                                             "(default: KUBECONFIG first path or ~/.kube/config)")
         if command == "monitor":
             command_parser.add_argument("--interval", type=int, default=30, help="Seconds between polls")
             command_parser.add_argument("--count", type=int, default=0, help="0=forever")
@@ -737,22 +1162,41 @@ def main() -> int:
             command_parser.add_argument("--yes", action="store_true")
             command_parser.add_argument("--confirm", help="Must equal the cluster name in config")
     args = parser.parse_args()
+    if args.command is None:
+        parser.print_help()
+        return 0
     try:
         lab = Lab(args.config)
-        if args.command == "preflight": lab.preflight()
-        elif args.command == "access": lab.access()
-        elif args.command == "adopt": lab.adopt()
-        elif args.command == "create": lab.create()
-        elif args.command == "start": lab.start()
-        elif args.command == "up": lab.up()
-        elif args.command == "stop": lab.stop()
-        elif args.command == "status": lab.status()
-        elif args.command == "doctor": lab.doctor()
-        elif args.command == "diagnose": lab.diagnose()
-        elif args.command == "test": lab.test(keep=args.keep)
-        elif args.command == "monitor": lab.monitor(args.interval, args.count)
-        elif args.command == "reset-k8s": lab.reset_k8s(args.yes, args.confirm)
-        elif args.command == "destroy": lab.destroy(args.yes, args.confirm)
+        if args.command == "preflight":
+            lab.preflight()
+        elif args.command == "access":
+            lab.access()
+        elif args.command == "adopt":
+            lab.adopt()
+        elif args.command == "context":
+            lab.context(args.action, args.name, args.target)
+        elif args.command == "create":
+            lab.create()
+        elif args.command == "start":
+            lab.start()
+        elif args.command == "up":
+            lab.up()
+        elif args.command == "stop":
+            lab.stop()
+        elif args.command == "status":
+            lab.status()
+        elif args.command == "doctor":
+            lab.doctor()
+        elif args.command == "diagnose":
+            lab.diagnose()
+        elif args.command == "test":
+            lab.test(keep=args.keep)
+        elif args.command == "monitor":
+            lab.monitor(args.interval, args.count)
+        elif args.command == "reset-k8s":
+            lab.reset_k8s(args.yes, args.confirm)
+        elif args.command == "destroy":
+            lab.destroy(args.yes, args.confirm)
         return 0
     except (LabError, KeyError, ValueError, FileNotFoundError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

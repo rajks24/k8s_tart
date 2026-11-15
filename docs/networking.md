@@ -1,5 +1,7 @@
 # Networking: Tart -> shim -> socket_vmnet -> kubeadm
 
+[Documentation index](README.md) · [Project README](../README.md)
+
 ## Working network topology
 
 ```text
@@ -21,33 +23,38 @@ The project preserves `/opt/tart-vmnet-shim/bin/softnet` exactly as found.
 It prepends `/opt/tart-vmnet-shim/bin` to PATH for each `tart run`, and sets
 `SOCKET_VMNET_PATH` on that child process. This is required because Tart
 resolves the executable named `softnet` through PATH. The shim is not the
-`socket_vmnet` daemon; the daemon must already be running.
+`socket_vmnet` daemon, the daemon must already be running.
 
 The upstream shim documentation notes limitations: packet filtering flags
 such as `--net-softnet-allow` are ignored, and loss of the daemon's socket
 requires restarting VM networking. Do not use this shim to assert isolation.
 
-## Verify the existing daemon and shim (no modifications)
+## Install first, then verify (no modifications)
+
+For a new Mac, follow [shim-setup.md](shim-setup.md) completely. It installs
+the daemon and compatibility shim, maps each installation layout to the right
+`cluster.toml` socket path, and explains the limits of preflight. Use the
+commands below to verify an installation that already exists.
 
 ```bash
 ls -l /opt/tart-vmnet-shim/bin/softnet
 stat -f '%Su %Sp %N' /opt/tart-vmnet-shim/bin/softnet
 pgrep -fl socket_vmnet
-ls -l /private/var/run/lima/socket_vmnet.shared
-python3 k8sctl.py preflight
+ls -l /var/run/socket_vmnet
+k8sctl preflight
 ```
 
-If your daemon uses `/var/run/socket_vmnet` or another location, update only
-`network.socket_path` in `config/cluster.toml`; do **not** reinstall the
-working daemon just because the default path differs.
+If your daemon uses another location, update `network.socket_path`, `subnet`,
+and `gateway` in `config/cluster.toml` to match the daemon. Do **not** reinstall
+a working daemon merely because its socket differs from the default.
 
 ## Existing IPs last observed in the reference discussion
 
-| VM | Observed (example, may change) |
-|---|---|
-| k8s-cp | 192.168.105.4 |
-| k8s-w1 | 192.168.105.2 |
-| k8s-w2 | 192.168.105.3 |
+| VM     | Observed (example, may change) |
+| ------ | ------------------------------ |
+| k8s-cp | 192.168.105.4                  |
+| k8s-w1 | 192.168.105.2                  |
+| k8s-w2 | 192.168.105.3                  |
 
 Current IPs MUST be discovered using `tart ip --resolver=agent`.
 Your control plane may still carry its last IP in:
@@ -78,7 +85,7 @@ done
 ```
 
 2. Back up `/etc/bootptab` (if it exists). This file is system-wide and may
-   include other VMs; NEVER overwrite reservations belonging to other tools.
+   include other VMs and NEVER overwrite reservations belonging to other tools.
 
 ```bash
 sudo cp -p /etc/bootptab "/etc/bootptab.bak.$(date +%Y%m%d-%H%M%S)" \
@@ -86,7 +93,7 @@ sudo cp -p /etc/bootptab "/etc/bootptab.bak.$(date +%Y%m%d-%H%M%S)" \
 sudo nano /etc/bootptab
 ```
 
-3. Ensure its `%%` header is present; **append** entries like these with the
+3. Ensure its `%%` header is present, **append** entries like these with the
    MACs observed above (replace the example MACs with real values):
 
 ```text
@@ -121,7 +128,7 @@ it obtains the actual address from the Linux guest NIC.
 
 ```bash
 # 1. Daemon/socket and Tart VM state
-python3 k8sctl.py preflight
+k8sctl preflight
 tart list
 
 # 2. Host-side resolved addresses
@@ -133,11 +140,11 @@ tart ip --resolver=agent k8s-w2
 ssh admin@192.168.105.2 'ping -c 3 192.168.105.4'
 
 # 4. Kubernetes topology and cross-worker test
-python3 k8sctl.py doctor
-python3 k8sctl.py test
+k8sctl doctor
+k8sctl test
 ```
 
-`preflight` checks that Tart sees your *installed* shim via its prefixed
+`preflight` checks that Tart sees your _installed_ shim via its prefixed
 PATH, that the `socket_vmnet` socket exists, and that a local Unix socket
 connection can be established. It does not start/restart daemons or change
 networking.
@@ -155,3 +162,11 @@ Do not just edit the state file to suppress the guard.
 
 Read: https://github.com/lima-vm/socket_vmnet#how-to-reserve-dhcp-addresses
 Read: https://github.com/tannevaled/socket-vmnet-shim
+
+## Related documentation
+
+- [Softnet shim setup](shim-setup.md) covers first-time host installation and
+  preflight troubleshooting.
+- [Architecture](architecture.md) shows where the host network fits into the
+  complete system.
+- [Operations runbook](runbook.md) covers cluster diagnosis and recovery.

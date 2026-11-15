@@ -4,7 +4,24 @@ logs/
 reports/
 __pycache__/
 *.py[cod]
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+.env
+.env.*
+!.env.example
 .DS_Store
+.idea/
+.vscode/
+# Optional machine-local configuration; invoke with --config.
+config/*.local.toml
+# Common credential formats must never be committed.
+*.key
+*.pem
+*.kubeconfig
+known_hosts
 # downloaded third-party manifest cached by the tool
 vendor/kube-flannel-*.yml
 # existing separately managed shim source checkout; don't accidentally embed a nested Git repository

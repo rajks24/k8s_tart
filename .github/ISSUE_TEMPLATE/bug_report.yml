@@ -1,0 +1,34 @@
+name: Bug report
+description: Report reproducible automation behavior without including credentials.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not attach kubeconfigs, private keys, bootstrap tokens, or unreviewed diagnostic bundles."
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: Include the k8sctl commands and sanitized output.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: macOS, Apple Silicon model, Tart, Python, Kubernetes, and k8sctl versions.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Review reports before sharing, remove credentials and workload-sensitive data.

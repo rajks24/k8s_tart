@@ -2,8 +2,33 @@
 # Idempotent *initial* guest preparation. Existing initialized nodes are skipped
 # by the macOS orchestrator. Never upgrade kubeadm/kubelet on a live cluster.
 set -Eeuo pipefail
-NODE="${1:?expected node name}"; K8S_MINOR="${2:?expected Kubernetes minor}"
+NODE="${1:?expected node name}"
+K8S_MINOR="${2:?expected Kubernetes minor}"
+K8S_KEY_SHA256="${3:?expected Kubernetes Release.key SHA-256}"
 export DEBIAN_FRONTEND=noninteractive
+
+wait_for_apt_locks() {
+  local timeout=600 deadline=$((SECONDS + 600))
+  local locks=(
+    /var/lib/dpkg/lock-frontend
+    /var/lib/dpkg/lock
+    /var/cache/apt/archives/lock
+    /var/lib/apt/lists/lock
+  )
+  while fuser "${locks[@]}" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      echo "Timed out after ${timeout}s waiting for Ubuntu APT/dpkg locks" >&2
+      fuser -v "${locks[@]}" >&2 || true
+      return 1
+    fi
+    echo 'Waiting for Ubuntu background package updates to release APT/dpkg locks...'
+    sleep 5
+  done
+}
+
+apt_get() {
+  apt-get -o DPkg::Lock::Timeout=600 "$@"
+}
 
 echo "==> Preparing $NODE for Kubernetes $K8S_MINOR ($(uname -m))"
 if [[ $(uname -m) != aarch64 ]]; then echo 'Expected Ubuntu ARM64' >&2; exit 1; fi
@@ -31,8 +56,10 @@ net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward = 1
 SYSCTL
 sysctl --system >/dev/null
-apt-get update
-apt-get install -y ca-certificates curl gpg apt-transport-https containerd openssh-server
+wait_for_apt_locks
+dpkg --configure -a
+apt_get update
+apt_get install -y ca-certificates curl gpg apt-transport-https containerd openssh-server
 mkdir -p /etc/containerd
 if [[ ! -s /etc/containerd/config.toml ]]; then
   containerd config default >/etc/containerd/config.toml
@@ -55,12 +82,19 @@ systemctl enable --now containerd
 systemctl restart containerd
 systemctl enable --now ssh
 mkdir -p -m 755 /etc/apt/keyrings
-curl -fsSL "https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/Release.key" \
-  | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+key_file="$(mktemp)"
+trap 'rm -f "$key_file"' EXIT
+curl -fsSL "https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/Release.key" -o "$key_file"
+printf '%s  %s\n' "$K8S_KEY_SHA256" "$key_file" | sha256sum --check --status || {
+  echo 'Kubernetes Release.key SHA-256 verification failed' >&2
+  exit 7
+}
+gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg "$key_file"
 printf 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/%s/deb/ /\n' "$K8S_MINOR" \
   >/etc/apt/sources.list.d/kubernetes.list
-apt-get update
-apt-get install -y kubelet kubeadm kubectl
+wait_for_apt_locks
+apt_get update
+apt_get install -y kubelet kubeadm kubectl
 apt-mark hold kubelet kubeadm kubectl
 systemctl enable kubelet
 

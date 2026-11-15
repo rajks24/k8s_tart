@@ -1,22 +1,29 @@
 # Edit before first NEW installation. For your running cluster, use `adopt` first.
 [cluster]
 name = "tart-kubeadm-lab"
+# Additional executable names installed alongside `k8sctl` by `make install-cli`.
+cli_aliases = ["ttk"]
 ssh_user = "admin"
 ssh_private_key = "~/.ssh/id_ed25519"
-ubuntu_image = "ghcr.io/cirruslabs/ubuntu:24.04"
+# Reviewed ARM64 image pinned by digest for reproducible provisioning.
+ubuntu_image = "ghcr.io/cirruslabs/ubuntu@sha256:3acc11bebedcbcb813fb17dd0a4671a8c2e6baed537f3caa7922e170ed8a04ed"
 kubernetes_minor = "v1.37"           # Kubernetes APT repository per minor release
+kubernetes_release_key_sha256 = "7627818cf7bae52f9008c93e8b1f961f53dea11d40891778de216fb1b43be54d"
 pod_cidr = "10.244.0.0/16"
 service_cidr = "10.96.0.0/12"
 flannel_version = "v0.28.10"          # Pinned release manifest
+flannel_sha256 = "393bdbce53eb50c8eb97dd513b218518b7d6e7985dc7b889be956e112a711084"
 ip_wait_seconds = 180
 ssh_wait_seconds = 120
 
 [network]
 mode = "softnet"
-# Existing shim; NOT installed or modified by this project.
+# Install/verify the daemon and shim first: docs/shim-setup.md
+# k8sctl does NOT install or modify either component during provisioning.
 softnet_bin = "/opt/tart-vmnet-shim/bin/softnet"
-# Override this if your existing socket_vmnet daemon uses another socket.
-socket_path = "/private/var/run/lima/socket_vmnet.shared"
+# This default matches the recommended /opt/socket_vmnet LaunchDaemon.
+# Homebrew and Lima-managed daemons use different socket paths, see the guide.
+socket_path = "/var/run/socket_vmnet"
 subnet = "192.168.105.0/24"
 gateway = "192.168.105.1"
 

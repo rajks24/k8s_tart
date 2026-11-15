@@ -18,7 +18,7 @@ fi
 printf 'Shim source: %s\nBinary destination: %s\nMode: %s\n' "$SOURCE" "$DEST" "$MODE"
 printf 'NOTE: This installs a root-owned setuid binary. Review local source and build provenance!\n'
 if [[ "$MODE" == --dry-run ]]; then
-  echo 'DRY RUN: would execute cargo build --release and install binary after explicit confirmation.'
+  echo 'DRY RUN: would execute cargo build --locked --release and install binary after explicit confirmation.'
   exit 0
 fi
 [[ "$(uname -s)" == Darwin ]] || { echo 'Only macOS supported' >&2; exit 1; }
@@ -26,7 +26,7 @@ command -v cargo >/dev/null || { echo 'Rust cargo required' >&2; exit 1; }
 printf 'Type exactly REPLACE-SOFTNET to approve replacing the installed shim: '
 read -r reply
 [[ "$reply" == REPLACE-SOFTNET ]] || { echo 'Cancelled'; exit 1; }
-( cd "$SOURCE" && cargo build --release )
+( cd "$SOURCE" && cargo build --locked --release )
 BIN="$SOURCE/target/release/softnet"
 [[ -x "$BIN" ]] || { echo 'Build did not produce softnet binary' >&2; exit 1; }
 sudo install -d -o root -g wheel -m 0755 "$(dirname "$DEST")"

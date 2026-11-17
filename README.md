@@ -242,6 +242,7 @@ Provision steps: `preflight -> clone missing VMs -> tart run --net-softnet -> ag
 | `context remove`                             | Remove managed context and restore prior selection       | Changes client kubeconfig only  |
 | `create`                                     | Clone and size only missing VMs                          | Creates VMs                     |
 | `start`                                      | Start stopped VMs with shim and IP drift check           | No reset                        |
+| `ssh NODE`                                   | Open a terminal on a configured running node             | No                              |
 | `up`                                         | Reconcile new/missing Kubernetes components              | Changes missing components      |
 | `status`                                     | VM IP/state, Kubernetes nodes and nonrunning Pods        | No                              |
 | `doctor`                                     | Read-only host, guest and Kubernetes health checks       | No                              |
@@ -262,6 +263,8 @@ The [shim setup guide](docs/shim-setup.md) covers new installation, daemon confi
 
 ```bash
 k8sctl status
+k8sctl ssh k8s-cp
+k8sctl ssh k8s-w1 --command 'hostname && uptime'
 k8sctl monitor --interval 30 --count 10
 k8sctl diagnose
 k8sctl stop

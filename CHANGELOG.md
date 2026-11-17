@@ -12,6 +12,7 @@ Versioning and the structure of Keep a Changelog.
   check.
 - README lifecycle diagram and task-oriented documentation index with validated
   cross-document links.
+- `k8sctl ssh NODE` for guarded interactive access and one-off node commands.
 - Integrity verification for downloaded Flannel manifests.
 - Immutable Ubuntu base-image reference.
 - From-scratch `socket_vmnet` daemon and Softnet shim installation guide.

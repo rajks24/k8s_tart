@@ -19,6 +19,24 @@ real logs can contain workload-sensitive details. Review before sharing.
 
 ## Inspect manually
 
+Open an interactive shell on any configured running node without looking up its
+IP address:
+
+```bash
+k8sctl ssh k8s-cp
+k8sctl ssh k8s-w1
+k8sctl ssh k8s-w2
+```
+
+For a one-off command, use `--command` (or `-c`):
+
+```bash
+k8sctl ssh k8s-w1 --command 'sudo systemctl status kubelet --no-pager'
+```
+
+The command resolves only the requested VM, uses the configured SSH user and
+key, and refuses to connect if its address has drifted from recorded state.
+
 ```bash
 k8sctl context use
 kubectl get nodes -o wide

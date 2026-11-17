@@ -306,34 +306,35 @@ class Lab:
             else:
                 next_step("k8sctl up", "SSH and sudo are ready, so Kubernetes provisioning can run unattended")
 
-    def discover_ips(self) -> dict[str, str]:
+    def discover_node_ip(self, name: str) -> str:
         timeout = int(self.cluster["ip_wait_seconds"])
+        out(f"==> Waiting for agent IP: {name}")
+        end = time.monotonic() + timeout
+        last_error = ""
+        while time.monotonic() < end:
+            result = call(["tart", "ip", "--resolver=agent", name],
+                          check=False, timeout=15)
+            raw = result.stdout.strip().splitlines()
+            if result.returncode == 0 and raw:
+                try:
+                    ip = str(ipaddress.ip_address(raw[-1].strip()))
+                    if ipaddress.ip_address(ip) not in self.subnet:
+                        raise LabError(f"{name} IP {ip} is not in expected {self.subnet}")
+                    desired = self.vms[name].get("reserved_ip", "")
+                    if desired and desired != ip:
+                        raise LabError(f"{name}: DHCP address {ip} != configured reservation {desired}")
+                    out(f"  {name:10s} {ip}")
+                    return ip
+                except ValueError:
+                    pass
+            last_error = result.stderr.strip()[-200:]
+            time.sleep(3)
+        raise LabError(f"Could not resolve {name} via Tart guest agent ({last_error}).")
+
+    def discover_ips(self) -> dict[str, str]:
         ips = {}
         for name in self.vms:
-            out(f"==> Waiting for agent IP: {name}")
-            end = time.monotonic() + timeout
-            last_error = ""
-            while time.monotonic() < end:
-                result = call(["tart", "ip", "--resolver=agent", name],
-                              check=False, timeout=15)
-                raw = result.stdout.strip().splitlines()
-                if result.returncode == 0 and raw:
-                    try:
-                        ip = str(ipaddress.ip_address(raw[-1].strip()))
-                        if ipaddress.ip_address(ip) not in self.subnet:
-                            raise LabError(f"{name} IP {ip} is not in expected {self.subnet}")
-                        desired = self.vms[name].get("reserved_ip", "")
-                        if desired and desired != ip:
-                            raise LabError(f"{name}: DHCP address {ip} != configured reservation {desired}")
-                        ips[name] = ip
-                        out(f"  {name:10s} {ip}")
-                        break
-                    except ValueError:
-                        pass
-                last_error = result.stderr.strip()[-200:]
-                time.sleep(3)
-            if name not in ips:
-                raise LabError(f"Could not resolve {name} via Tart guest agent ({last_error}).")
+            ips[name] = self.discover_node_ip(name)
         return ips
 
     def existing_ips(self) -> dict[str, str]:
@@ -378,6 +379,26 @@ class Lab:
             timeout: int = 40, check: bool = True) -> subprocess.CompletedProcess[str]:
         return call(self.ssh_base(ip) + [command], input_text=stdin,
                     timeout=timeout, check=check)
+
+    def connect_node(self, name: str, remote_command: str | None = None) -> None:
+        if name not in self.vms:
+            choices = ", ".join(self.vms)
+            raise LabError(f"Unknown node {name!r}. Configured nodes: {choices}")
+        info = self.vm_info(name)
+        if info is None:
+            raise LabError(f"Node {name} does not exist. Run `k8sctl create` first.")
+        if not info.get("Running"):
+            raise LabError(f"Node {name} is stopped. Run `k8sctl start` first.")
+        ip = self.discover_node_ip(name)
+        self.guard_ips({name: ip})
+        out(f"==> Connecting to {name} as {self.ssh_user}@{ip}")
+        if remote_command is None:
+            args = self.ssh_base(ip, interactive=True)
+        else:
+            args = self.ssh_base(ip) + [remote_command]
+        result = subprocess.run(args, check=False)
+        if result.returncode:
+            raise LabError(f"SSH to {name} exited with status {result.returncode}")
 
     def wait_ssh(self, ips: dict[str, str]) -> None:
         timeout = int(self.cluster["ssh_wait_seconds"])
@@ -1134,6 +1155,7 @@ def main() -> int:
         ("context", "Install, select, inspect, or remove the lab kubectl context"),
         ("create", "Create only missing Tart VMs; never change existing ones"),
         ("start", "Start existing VMs using the shim; block on IP drift"),
+        ("ssh", "Open an SSH session to a configured cluster node"),
         ("up", "Idempotent-ish fresh provision/reconcile; preserve existing kubeadm state"),
         ("stop", "Stop Tart VMs without deleting Kubernetes data"),
         ("status", "Quick VM and cluster status"),
@@ -1158,6 +1180,10 @@ def main() -> int:
         if command == "monitor":
             command_parser.add_argument("--interval", type=int, default=30, help="Seconds between polls")
             command_parser.add_argument("--count", type=int, default=0, help="0=forever")
+        if command == "ssh":
+            command_parser.add_argument("node", help="Configured node name, for example k8s-cp or k8s-w1")
+            command_parser.add_argument("-c", "--command", dest="remote_command",
+                                        help="Run one remote shell command instead of opening a terminal")
         if command in ("reset-k8s", "destroy"):
             command_parser.add_argument("--yes", action="store_true")
             command_parser.add_argument("--confirm", help="Must equal the cluster name in config")
@@ -1179,6 +1205,8 @@ def main() -> int:
             lab.create()
         elif args.command == "start":
             lab.start()
+        elif args.command == "ssh":
+            lab.connect_node(args.node, args.remote_command)
         elif args.command == "up":
             lab.up()
         elif args.command == "stop":

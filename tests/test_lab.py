@@ -70,6 +70,39 @@ class LabSafetyTests(unittest.TestCase):
                 'k8s-w1': 'passwordless sudo unavailable',
             })
 
+    def test_ssh_rejects_unknown_node(self):
+        with self.assertRaisesRegex(LabError, 'Unknown node'):
+            self.lab.connect_node('not-a-node')
+
+    def test_ssh_rejects_stopped_node(self):
+        with patch.object(self.lab, 'vm_info', return_value={'Running': False}), \
+             self.assertRaisesRegex(LabError, 'is stopped'):
+            self.lab.connect_node('k8s-cp')
+
+    def test_ssh_opens_interactive_session_with_ip_guard(self):
+        completed = subprocess.CompletedProcess([], 0)
+        with patch.object(self.lab, 'vm_info', return_value={'Running': True}), \
+             patch.object(self.lab, 'discover_node_ip', return_value='192.168.105.11'), \
+             patch.object(self.lab, 'guard_ips') as guard, \
+             patch('k8sctl.subprocess.run', return_value=completed) as invoke:
+            self.lab.connect_node('k8s-cp')
+        guard.assert_called_once_with({'k8s-cp': '192.168.105.11'})
+        ssh_args = invoke.call_args.args[0]
+        self.assertIn('-tt', ssh_args)
+        self.assertEqual(ssh_args[-1], 'admin@192.168.105.11')
+
+    def test_ssh_runs_remote_command_without_tty(self):
+        completed = subprocess.CompletedProcess([], 0)
+        with patch.object(self.lab, 'vm_info', return_value={'Running': True}), \
+             patch.object(self.lab, 'discover_node_ip', return_value='192.168.105.13'), \
+             patch.object(self.lab, 'guard_ips'), \
+             patch('k8sctl.subprocess.run', return_value=completed) as invoke:
+            self.lab.connect_node('k8s-w1', 'hostname && uptime')
+        ssh_args = invoke.call_args.args[0]
+        self.assertNotIn('-tt', ssh_args)
+        self.assertIn('BatchMode=yes', ssh_args)
+        self.assertEqual(ssh_args[-2:], ['admin@192.168.105.13', 'hostname && uptime'])
+
     def test_deletion_requires_exact_confirmation(self):
         for yes, phrase in [(False, 'tart-kubeadm-lab'), (True, 'wrong'), (True, None)]:
             with self.assertRaises(LabError):
